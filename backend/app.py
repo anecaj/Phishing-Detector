@@ -1,6 +1,5 @@
 """
 Phishing URL Detector — Flask API
-Loads a trained Random Forest model and exposes a /analyze endpoint.
 """
 import os
 import json
@@ -18,90 +17,68 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "model.pkl")
-META_PATH  = os.path.join(os.path.dirname(__file__), "model", "meta.json")
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "model", "model.pkl")
+META_PATH  = os.path.join(BASE_DIR, "model", "meta.json")
 
 model = None
 meta  = {}
 
-# ── Model loading ──────────────────────────────────────────────────────────────
-
 def load_or_train():
     global model, meta
+    os.makedirs(os.path.join(BASE_DIR, "model"), exist_ok=True)
     if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
-        logger.info("Loading pre-trained model...")
+        logger.info(f"Loading model from {MODEL_PATH}")
         with open(MODEL_PATH, "rb") as f:
             model = pickle.load(f)
         with open(META_PATH) as f:
             meta = json.load(f)
-        logger.info(f"Model loaded (ROC AUC: {meta.get('roc_auc', 'N/A')})")
+        logger.info(f"Model loaded — ROC AUC: {meta.get('roc_auc')}")
     else:
-        logger.info("No model found — training now...")
+        logger.info(f"No model at {MODEL_PATH} — training now...")
         from train import train as run_training
         model, meta = run_training()
+        logger.info("Training complete")
 
-
-# ── Risk scoring ───────────────────────────────────────────────────────────────
-
-def risk_label(score: float) -> str:
-    if score >= 0.75:
-        return "PHISHING"
-    if score >= 0.45:
-        return "SUSPICIOUS"
+def risk_label(score):
+    if score >= 0.75: return "PHISHING"
+    if score >= 0.45: return "SUSPICIOUS"
     return "SAFE"
 
-def risk_color(score: float) -> str:
-    if score >= 0.75:
-        return "#ff4d4d"
-    if score >= 0.45:
-        return "#fbbf24"
+def risk_color(score):
+    if score >= 0.75: return "#ff4d4d"
+    if score >= 0.45: return "#fbbf24"
     return "#4ade80"
 
-def top_features(url: str, n: int = 8) -> list[dict]:
-    """Return top N most important triggered features for this URL."""
+def top_features(url, n=8):
     if not meta.get("feature_importances"):
         return []
-
     feat_dict   = extract_feature_dict(url)
     importances = meta["feature_importances"]
-
     scored = []
     for name, value in feat_dict.items():
         importance = importances.get(name, 0)
-        # Weight by both importance and feature activation
-        activation = min(abs(float(value)), 1.0) if isinstance(value, (int, float)) else 0
+        activation = min(abs(float(value)), 1.0)
         scored.append({
-            "name": name,
-            "value": value,
+            "name": name, "value": value,
             "importance": round(importance, 4),
             "contribution": round(importance * (activation + 0.1), 4),
         })
-
     scored.sort(key=lambda x: x["contribution"], reverse=True)
     return scored[:n]
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 def analyze():
     if model is None:
         return jsonify({"error": "Model not ready yet — please try again in 30 seconds"}), 503
-
     data = request.get_json()
     if not data or not data.get("url"):
         return jsonify({"error": "Missing 'url' field"}), 400
-
     url = data["url"].strip()
-    if len(url) > 2000:
-        return jsonify({"error": "URL too long (max 2000 chars)"}), 400
-
     try:
-        features_obj = extract_features(url)
-        X = [features_obj.to_list()]
+        X = [extract_features(url).to_list()]
         prob = model.predict_proba(X)[0]
         phish_score = float(prob[1])
-
         return jsonify({
             "url": url,
             "phishing_probability": round(phish_score, 4),
@@ -113,14 +90,15 @@ def analyze():
             "model_auc": meta.get("roc_auc"),
         })
     except Exception as e:
-        logger.error(f"Analysis error for {url}: {e}")
+        logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.get("/api/model/info")
 def model_info():
     return jsonify({
         "ready": model is not None,
+        "model_path": MODEL_PATH,
+        "model_exists": os.path.exists(MODEL_PATH),
         "roc_auc": meta.get("roc_auc"),
         "training_samples": meta.get("training_samples"),
         "feature_count": len(meta.get("feature_names", [])),
@@ -130,17 +108,14 @@ def model_info():
         )[:10],
     })
 
-
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "model_ready": model is not None})
 
-
-# ── Startup ────────────────────────────────────────────────────────────────────
-
+# Start loading model in background thread
 _loader = threading.Thread(target=load_or_train, daemon=True)
 _loader.start()
 
 if __name__ == "__main__":
-    _loader.join()  # wait for model on direct run
+    _loader.join()
     app.run(host="0.0.0.0", port=5001, debug=False)
