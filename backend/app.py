@@ -23,22 +23,42 @@ META_PATH  = os.path.join(BASE_DIR, "model", "meta.json")
 
 model = None
 meta  = {}
+model_status = "initializing"
 
 def load_or_train():
-    global model, meta
-    os.makedirs(os.path.join(BASE_DIR, "model"), exist_ok=True)
-    if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
-        logger.info(f"Loading model from {MODEL_PATH}")
-        with open(MODEL_PATH, "rb") as f:
-            model = pickle.load(f)
-        with open(META_PATH) as f:
-            meta = json.load(f)
-        logger.info(f"Model loaded — ROC AUC: {meta.get('roc_auc')}")
-    else:
-        logger.info(f"No model at {MODEL_PATH} — training now...")
+    global model, meta, model_status
+    try:
+        os.makedirs(os.path.join(BASE_DIR, "model"), exist_ok=True)
+        if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
+            logger.info(f"Model file found — loading from {MODEL_PATH}")
+            model_status = "loading"
+            try:
+                with open(MODEL_PATH, "rb") as f:
+                    model = pickle.load(f)
+                with open(META_PATH) as f:
+                    meta = json.load(f)
+                model_status = "ready"
+                logger.info(f"Model loaded successfully — ROC AUC: {meta.get('roc_auc')}")
+                return
+            except Exception as e:
+                logger.error(f"Failed to load model: {e} — will retrain")
+                model = None
+                # Delete corrupt files
+                if os.path.exists(MODEL_PATH):
+                    os.remove(MODEL_PATH)
+                if os.path.exists(META_PATH):
+                    os.remove(META_PATH)
+
+        logger.info("No valid model found — training now...")
+        model_status = "training"
         from train import train as run_training
         model, meta = run_training()
-        logger.info("Training complete")
+        model_status = "ready"
+        logger.info("Training complete — model ready")
+
+    except Exception as e:
+        model_status = f"error: {str(e)}"
+        logger.error(f"load_or_train failed: {e}")
 
 def risk_label(score):
     if score >= 0.75: return "PHISHING"
@@ -70,7 +90,7 @@ def top_features(url, n=8):
 @app.post("/api/analyze")
 def analyze():
     if model is None:
-        return jsonify({"error": "Model not ready yet — please try again in 30 seconds"}), 503
+        return jsonify({"error": f"Model not ready yet ({model_status}) — please try again in 30 seconds"}), 503
     data = request.get_json()
     if not data or not data.get("url"):
         return jsonify({"error": "Missing 'url' field"}), 400
@@ -97,20 +117,17 @@ def analyze():
 def model_info():
     return jsonify({
         "ready": model is not None,
+        "status": model_status,
         "model_path": MODEL_PATH,
         "model_exists": os.path.exists(MODEL_PATH),
         "roc_auc": meta.get("roc_auc"),
         "training_samples": meta.get("training_samples"),
         "feature_count": len(meta.get("feature_names", [])),
-        "top_features": sorted(
-            meta.get("feature_importances", {}).items(),
-            key=lambda x: x[1], reverse=True
-        )[:10],
     })
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "model_ready": model is not None})
+    return jsonify({"status": "ok", "model_ready": model is not None, "model_status": model_status})
 
 # Start loading model in background thread
 _loader = threading.Thread(target=load_or_train, daemon=True)
