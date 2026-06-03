@@ -5,7 +5,6 @@ import os
 import json
 import pickle
 import logging
-import threading
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -23,42 +22,32 @@ META_PATH  = os.path.join(BASE_DIR, "model", "meta.json")
 
 model = None
 meta  = {}
-model_status = "initializing"
 
 def load_or_train():
-    global model, meta, model_status
-    try:
-        os.makedirs(os.path.join(BASE_DIR, "model"), exist_ok=True)
-        if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
-            logger.info(f"Model file found — loading from {MODEL_PATH}")
-            model_status = "loading"
-            try:
-                with open(MODEL_PATH, "rb") as f:
-                    model = pickle.load(f)
-                with open(META_PATH) as f:
-                    meta = json.load(f)
-                model_status = "ready"
-                logger.info(f"Model loaded successfully — ROC AUC: {meta.get('roc_auc')}")
-                return
-            except Exception as e:
-                logger.error(f"Failed to load model: {e} — will retrain")
-                model = None
-                # Delete corrupt files
-                if os.path.exists(MODEL_PATH):
-                    os.remove(MODEL_PATH)
-                if os.path.exists(META_PATH):
-                    os.remove(META_PATH)
+    global model, meta
+    os.makedirs(os.path.join(BASE_DIR, "model"), exist_ok=True)
+    if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
+        try:
+            logger.info(f"Loading model from {MODEL_PATH}")
+            with open(MODEL_PATH, "rb") as f:
+                model = pickle.load(f)
+            with open(META_PATH) as f:
+                meta = json.load(f)
+            logger.info(f"Model loaded — ROC AUC: {meta.get('roc_auc')}")
+            return
+        except Exception as e:
+            logger.error(f"Failed to load model: {e} — retraining")
+            model = None
+            for p in [MODEL_PATH, META_PATH]:
+                if os.path.exists(p):
+                    os.remove(p)
+    logger.info("Training model now...")
+    from train import train as run_training
+    model, meta = run_training()
+    logger.info("Training complete")
 
-        logger.info("No valid model found — training now...")
-        model_status = "training"
-        from train import train as run_training
-        model, meta = run_training()
-        model_status = "ready"
-        logger.info("Training complete — model ready")
-
-    except Exception as e:
-        model_status = f"error: {str(e)}"
-        logger.error(f"load_or_train failed: {e}")
+# Load synchronously at import time — works correctly with gunicorn --preload
+load_or_train()
 
 def risk_label(score):
     if score >= 0.75: return "PHISHING"
@@ -90,7 +79,7 @@ def top_features(url, n=8):
 @app.post("/api/analyze")
 def analyze():
     if model is None:
-        return jsonify({"error": f"Model not ready yet ({model_status}) — please try again in 30 seconds"}), 503
+        return jsonify({"error": "Model not ready — please try again"}), 503
     data = request.get_json()
     if not data or not data.get("url"):
         return jsonify({"error": "Missing 'url' field"}), 400
@@ -117,8 +106,6 @@ def analyze():
 def model_info():
     return jsonify({
         "ready": model is not None,
-        "status": model_status,
-        "model_path": MODEL_PATH,
         "model_exists": os.path.exists(MODEL_PATH),
         "roc_auc": meta.get("roc_auc"),
         "training_samples": meta.get("training_samples"),
@@ -127,12 +114,7 @@ def model_info():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "model_ready": model is not None, "model_status": model_status})
-
-# Start loading model in background thread
-_loader = threading.Thread(target=load_or_train, daemon=True)
-_loader.start()
+    return jsonify({"status": "ok", "model_ready": model is not None})
 
 if __name__ == "__main__":
-    _loader.join()
     app.run(host="0.0.0.0", port=5001, debug=False)
